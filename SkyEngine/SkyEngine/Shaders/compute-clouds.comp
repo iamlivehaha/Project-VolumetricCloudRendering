@@ -1,0 +1,1072 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_KHR_vulkan_glsl : enable
+
+
+precision highp float;
+
+
+#define WORKGROUP_SIZE 32
+layout (local_size_x = WORKGROUP_SIZE, local_size_y = WORKGROUP_SIZE) in;
+layout (set = 0, binding = 0, rgba32f) uniform writeonly image2D resultImage;
+layout (set = 1, binding = 0, rgba32f) uniform readonly image2D resultImagePrev;
+
+layout(set = 2, binding = 0) uniform UniformCameraObject {
+    mat4 view;
+    mat4 proj;
+    vec4 cameraPosition;
+    vec4 cameraParams;
+} camera;
+
+layout(set = 2, binding = 1) uniform UniformCameraObjectPrev {
+    mat4 view;
+    mat4 proj;
+    vec4 cameraPosition;
+} cameraPrev;
+
+// all of these components are calculated in SkyManager.h/.cpp
+layout(set = 2, binding = 2) uniform UniformSunObject { 
+    vec4 location;
+    vec4 direction;
+    vec4 color;
+    mat4 directionBasis;
+    float intensity;
+} sun;
+
+// note: a lot of sky constants are stored/precalculated in SkyManager.h / .cpp
+layout(set = 2, binding = 3) uniform UniformSkyObject {
+    
+    vec4 betaR;
+    vec4 betaV;
+    vec4 wind;
+    float mie_directional;
+} sky;
+
+// paramas available for cloud renderer UI panel
+layout(set = 2, binding = 4) uniform UniformCloudRendererObject {
+    
+    float coverage_rate;
+    float erosion_rate;
+    float extinction;
+    float tempfloat;
+    vec4 cloudinfo1;//cloudinfo.xyz: cloudtype_rate  w: local wind strength
+    vec4 cloudinfo2;//cloudinof1.x: sliver_intensity =0.7  y: sliver_spread = 0.1; z: sun_intensity  w: backgroungColor_blend
+    vec4 cloudinfo3;//x: global wind_strength  y: percipitation_rate
+    vec4 cloudinfo4;//x: RenderingMode y:sdf_scale z:rayMarchStepSize w:max_steps
+    vec4 cloudinfo5;//x:ambientcolormode  y:shadowmode z: SDFShadowSteps w:LightTangent
+    vec4 wind_direction;//wind_direction.xyz: local wind's wind_dir.xyz //wind_direction.w: cirruscloudtype
+    vec4 tempVector;
+} cloudrenderer;
+
+layout(set = 2, binding = 5) uniform sampler2D cloudPlacement;
+layout(set = 2, binding = 6) uniform sampler2D nightSkyMap;
+layout(set = 2, binding = 7) uniform sampler2D curlNoise;
+layout(set = 2, binding = 8) uniform sampler3D lowResCloudShape;
+layout(set = 2, binding = 9) uniform sampler3D hiResCloudShape;
+layout(set = 2, binding = 10) uniform sampler2D cirroNoise;
+layout(set = 2, binding = 11) uniform sampler3D sdfCloudShape_01;
+layout(set = 2, binding = 12) uniform sampler3D sdfCloudShape_02;
+
+struct Intersection {
+    vec3 normal;
+    vec3 point;
+    bool valid;
+    float t;
+};
+
+//采样完后云的信息
+struct CloudInfo
+{
+    float density;          //密度
+    float sdf;              //有向距离场(当渲染模式为Bake时启用)
+    float sdfDensity;              //sdf信息，-1表示不在sdf内
+};
+//enable keywords
+#define ENABLE_NEW_NOISE 0
+#define ENABLE_VOXELNOISE 1
+
+#define ATMOSPHERE_RADIUS 1000000.0  //2000000.0  减半对云层距离 更小范围景象更好
+#define ATMOSPHERE_THICKNESS  0.5 * ATMOSPHERE_RADIUS * 0.025// 2500;
+
+#define EPSILON 0.0001
+#define PI 3.14159265
+#define E 2.718281828459
+
+#define THREE_OVER_SIXTEENPI 0.05968310365946075
+#define ONE_OVER_FOURPI 0.07957747154594767
+
+#define BACK_SCATTER_MIN 0.05
+#define BACK_SCATTER_MAX 0.1
+
+//Model Cloud: SDF Box Bound
+#define SDFBOX_LENGTH 10000
+
+//return the minst distance(0~x) of lenth from point to box
+float sdfBox(vec3 p, vec3 b)
+{
+    vec3 q = abs(p)-b;
+    return length(max(q,0.0))+ min(max(q.x,max(q.y,q.z)),0.0);
+}
+
+float sdBoxFrame( vec3 p, vec3 b, float e )
+{
+       p = abs(p  )-b;
+  vec3 q = abs(p+e)-e;
+  return min(min(
+      length(max(vec3(p.x,q.y,q.z),0.0))+min(max(p.x,max(q.y,q.z)),0.0),
+      length(max(vec3(q.x,p.y,q.z),0.0))+min(max(q.x,max(p.y,q.z)),0.0)),
+      length(max(vec3(q.x,q.y,p.z),0.0))+min(max(q.x,max(q.y,p.z)),0.0));
+}
+
+//Raymarching Phases 
+#define Phase1 0x00000001
+#define Phase2 0x00000002
+#define Phase3 0x00000003
+
+float remap(in float value, in float oldMin, in float oldMax, in float newMin, in float newMax) {
+    return newMin + (((value - oldMin) / (oldMax - oldMin)) * (newMax - newMin));
+}
+
+float remapClamped(in float value, in float oldMin, in float oldMax, in float newMin, in float newMax) {
+    return clamp(newMin + (((value - oldMin) / (oldMax - oldMin)) * (newMax - newMin)), newMin, newMax);
+}
+
+float hgPhase(in float cosTheta, in float g) {
+    float g2 = g * g;
+    float inv = 1.0 / pow(1.0 - 2.0 * g * cosTheta + g2, 1.5);
+    return ONE_OVER_FOURPI * ((1.0 - g2) * inv);
+}
+
+//后向散射会给空中的云一个太阳反方向的光照补正。
+float applyBackScattering(float phase,float extinction)
+{
+    float v = 1/PI*mix(BACK_SCATTER_MIN,BACK_SCATTER_MAX,extinction);
+    return max(phase,v);
+}
+
+/// ATMOSPHERE COLOR BEGIN: adapted from open source of zz85 on Github, math from Preetham Model, initially implemented by Simon Wallner and Martin Upitis
+///https://courses.cs.duke.edu/fall01/cps124/resources/p91-preetham.pdf
+/// Credit applies to everything before ATMOSPHERE COLOR END
+
+#define SUN_ANGULAR_COS 0.998956676946448443553574619906976478926848692873900859324
+
+//Beer-Lambert law sample params
+#define MULTISCATTERING_BASE 0.2
+
+float rayleighPhase(in float cosTheta) {
+    return THREE_OVER_SIXTEENPI * (1.0 + cosTheta * cosTheta);
+}
+
+vec3 getAtmosphereColorPhysical(in vec3 dir, in vec3 sunDir) {
+    vec3 color = vec3(0);
+
+    vec3 sunPos = sun.location.xyz; 
+    float sunE = sun.intensity*cloudrenderer.cloudinfo2.z; 
+    vec3 BetaR = sky.betaR.xyz;   
+    vec3 BetaM = sky.betaV.xyz; 
+
+    // optical length  
+    //zenith angle  天顶角
+    float zenith = acos(max(0.0, dot(vec3(0,1,0), sunDir)));//acos(max(0.0, dir.y)); // clamp( dot(vec3(0,1,0), normalize(dir)), -1.0, 1.0 )
+    float inverse = 1.0 / (cos(zenith) + 0.15 * pow(93.885 - ((zenith * 180.0) / PI), -1.253));
+    float sR = 8.4E3 * inverse;
+    float sM = 1.25E3 * inverse;
+
+    vec3 fex = exp( -BetaR * sR + BetaM * sM);
+
+    float cosTheta = dot(sunDir, dir);
+
+    //In-scattering
+    float rPhase = rayleighPhase(cosTheta * 0.5 + 0.5);
+    vec3 betaRTheta = BetaR * rPhase;
+    float mPhase = hgPhase(cosTheta, sky.mie_directional);
+    vec3 betaMTheta = BetaM * mPhase;
+
+    float yDot = 1.0 - sunDir.y;
+    yDot *= yDot * yDot * yDot * yDot;
+    vec3 betas = (betaRTheta + betaMTheta) / (BetaR + BetaM);
+    vec3 Lin = pow(sunE * (betas) * (1.0 - fex), vec3(1.5));
+    Lin *= mix(vec3(1), pow(sunE * (betas) * fex, vec3(0.5)), clamp(yDot, 0.0, 1.0));
+
+    //Composition + solar disc
+    float sunDisk = smoothstep(SUN_ANGULAR_COS, SUN_ANGULAR_COS + 0.00002, cosTheta);
+    //sunDisk = 0;
+    vec3 L0 = 0.1 * fex;
+    L0 += (sunE * 15000.0 * fex) * sunDisk;
+
+    color = (Lin + L0) * 0.04 + vec3(0.0, 0.0003, 0.00075);
+
+    // return color in HDR space
+    return color;
+}
+
+float Ei( float z )
+{
+    return 0.5772156649015328606065 + log( 1e-4 + abs(z) ) + z * (1.0 + z * (0.25 + z * ( (1.0/18.0) + z * ( (1.0/96.0) + z * 
+    (1.0/600.0) ) ) ) ); // For x!=0
+}
+
+//----------------------Ambient Scattering--------------------------//
+
+vec3 getAmbientColorPhysical ( float _RelativeHeight, float _ExtinctionCoeff,vec3 _IsotropicLightTop, vec3 _IsotropicLightBottom)
+{
+     float Ht = 1-_RelativeHeight; // Height to the top of the volume
+     float a = -_ExtinctionCoeff * Ht;
+     vec3 IsotropicScatteringTop = _IsotropicLightTop * max( 0.0, exp( a ) - a * Ei( a ));
+     float Hb = _RelativeHeight; // Height to the bottom of the volume
+     a = -_ExtinctionCoeff * Hb;
+     vec3 IsotropicScatteringBottom = _IsotropicLightBottom * max( 0.0, exp( a ) - a * Ei( a ));
+     return IsotropicScatteringTop + IsotropicScatteringBottom;
+}
+
+vec3 getAmbientColorNumerical(in vec3 dir) {
+    // TODO: physical algorithm
+    vec3 up = mix(vec3(0.3, 0.7, 1.0), vec3(0.15, 0.65, 0.9), dir.y);
+    vec3 down = vec3(0.8, 0.9, 1.0);
+    float y = dir.y;
+    y = smoothstep(0, 1, clamp(remap(y, 0, 0.1, 0, 1), 0, 1));
+    return mix(down, up, y);
+}
+
+vec3 CalAmbientScattering(vec3 ambientScattering,vec3 rayDirection,vec3 backgroundCol,float rHeight,float extinctionCoeff, float cloudDensity,float accumDensity)
+{
+    vec3 ambientColor;
+    vec3 nightambientColor = (vec3(0.3, 0.6, 4.0) * 0.05 * pow(rayDirection.y, 0.03125));
+    vec3 numambientColor = getAmbientColorNumerical(rayDirection);
+    if(sun.direction.y >= 0.0) 
+    {
+        if(cloudrenderer.cloudinfo5.x == 0)// physical based ambient color
+        {
+            ambientColor = getAmbientColorPhysical(rHeight,extinctionCoeff,backgroundCol,backgroundCol*0.4);
+        }else if(cloudrenderer.cloudinfo5.x == 1) // numerical ambient color
+        {
+            ambientColor = numambientColor;
+        }
+    } else {
+        // night ambient color
+        ambientColor = getAmbientColorPhysical(rHeight,extinctionCoeff,nightambientColor,nightambientColor*0.4);
+    }
+
+    float PhaseAmbient = pow(1.0f-cloudDensity,0.25)*rHeight;//extinction* height_bias 
+    return mix(ambientScattering,PhaseAmbient*ambientColor,(1.0 - accumDensity));
+}
+
+//----------------------Ambient Scattering--------------------------//
+
+/// ATMOSPHERE COLOR END: see credit at BEGIN
+
+vec3 NightSkyColor( in vec2 uv ) {
+    return texture(nightSkyMap, uv).xyz;
+}
+
+
+// Compute sphere intersection
+Intersection raySphereIntersection(in vec3 ro, in vec3 rd, in vec4 sphere) {
+	Intersection isect;
+    isect.valid = false;
+    isect.point = vec3(0);
+    isect.normal = vec3(0, 1, 0);
+    isect.t = 0;
+    
+    // no rotation, only uniform scale, always a sphere
+    // Transform Ray such that the spheres move down, such that the camera is close to the sky dome
+    // Only change sphere origin because you can't translate a direction
+    ro -= sphere.xyz;  //sphere o
+    ro /= sphere.w;    //sphere radius
+    
+    float A = dot(rd, rd);
+    float B = 2.0 * dot(rd, ro);
+    float C = dot(ro, ro) - 0.25;
+    float discriminant = B * B - 4.0 * A * C;
+    
+    if (discriminant < 0.0) return isect;
+    float t = (-sqrt(discriminant) - B) / A * 0.5;
+    if (t < 0.0) t = (sqrt(discriminant) - B) / A * 0.5;
+    
+    if (t >= 0.0) {
+        isect.valid = true;
+    	vec3 p = vec3(ro + rd * t);
+        isect.normal = normalize(p);
+        p *= sphere.w;
+        p += sphere.xyz;
+        isect.point = p;
+        isect.t = length(p - ro);
+    }
+    
+    return isect;
+}
+
+// Get the point projected to the inner atmosphere shell
+vec3 getProjectedShellPoint(in vec3 pt, in vec3 center) {
+    return 0.5 * ATMOSPHERE_RADIUS * normalize(pt - center) + center;
+}
+
+// Given a point, the point projected to the inner atmosphere shell, and the thickness of the shell
+// return the normalized height within the shell.
+float getRelativeHeight(in vec3 pt, in vec3 projectedPt, in float thickness) {
+    return clamp(length(pt - projectedPt) / thickness, 0.0, 1.0);
+}
+
+// Get the blended density gradient for 3 different cloud types
+// relativeHeight is normalized distance from inner to outer atmosphere shell
+// cloudType is read from cloud placement blue channel
+float cloudLayerDensity(float relativeHeight, float cloudType) {
+    relativeHeight = clamp(relativeHeight, 0, 1);
+    
+//    float cumulus = max(0.0, remap(relativeHeight, 0.0, 0.2, 0.0, 1.0) * remap(relativeHeight, 0.7, 0.9, 1.0, 0.0));
+//    float stratocumulus = max(0.0, remap(relativeHeight, 0.0, 0.2, 0.0, 1.0) * remap(relativeHeight, 0.2, 0.7, 1.0, 0.0)); 
+//    float stratus = max(0.0, remap(relativeHeight, 0.0, 0.1, 0.0, 1.0) * remap(relativeHeight, 0.2, 0.3, 1.0, 0.0)); 
+
+
+    float altocumulus = max(0.0, remap(relativeHeight, 0.01, 0.3, 0.0, 1.0) * remap(relativeHeight, 0.6, 0.95, 1.0, 0.0))*cloudrenderer.cloudinfo1.z;
+    float cumulus = max(0.0, remap(relativeHeight, 0.0, 0.25, 0.0, 1.0) * remap(relativeHeight,  0.3, 0.65, 1.0, 0.0))*cloudrenderer.cloudinfo1.y; 
+    float stratus = max(0.0, remap(relativeHeight, 0, 0.1, 0.0, 1.0) * remap(relativeHeight, 0.2, 0.3, 1.0, 0.0))*cloudrenderer.cloudinfo1.x; 
+
+    float stratocumulus = mix(stratus, cumulus, clamp(cloudType * 2.0, 0.0, 1.0));
+    float cumulonimbus = mix(cumulus, altocumulus, clamp((cloudType - 0.5) * 2.0, 0.0, 1.0));
+    return mix(stratocumulus, cumulonimbus, cloudType);
+    
+}
+
+float cirroLayerDensity(float cr_streky, float cr_wispy, float cr_round,vec3 cloudinfo) {
+    
+    float density = remapClamped(cloudrenderer.wind_direction.w,0.5,1.0,remapClamped(cloudrenderer.wind_direction.w,0,0.5,cr_streky,cr_wispy),cr_round);
+    float coverage = cloudinfo.g*0.55;//cloudrenderer.tempfloat;
+    density = pow(density,1.0-remapClamped(coverage,0,1,-0.9,0.9));
+    density *=remapClamped(pow(coverage,3.0),0,0.5,0,1.0);
+    return density;
+    
+}
+
+float cloudCirroSample(in vec3 pos, in vec3 earthCenter) {
+    // TODO: curlNoise
+
+   // Only update every 16th pixel
+    int pxOffset = int(sun.color.a);
+    
+    int pxO_x = pxOffset % 4;
+    int pxO_y = pxOffset / 4;
+    uint pxTargetX = gl_GlobalInvocationID.x * 4 + pxO_x;
+    uint pxTargetY = gl_GlobalInvocationID.y * 4 + pxO_y;
+    vec2 uv = vec2(pxTargetX, pxTargetY) / vec2(1920, 1080);
+    float cirroDensity = 0;
+    vec3 currentProj = getProjectedShellPoint(pos, earthCenter);
+    vec3 cloudInfo = texture(cloudPlacement, 0.000009 * (currentProj.xz - camera.cameraPosition.xz)).xyz;
+    //cirroCloud represent cirroNoise r:cr_streky, g:cr_wispy b:cr_round
+    vec3 cirroCloud = texture(cirroNoise, 0.000009 *  (currentProj.xz - camera.cameraPosition.xz)).xyz; //0.000009
+    cirroDensity = cirroLayerDensity(cirroCloud.r,cirroCloud.g,cirroCloud.b,cloudInfo);
+
+    return cirroDensity;
+}
+
+float heightBiasCoverage(float coverage, float height) {
+    //coverage = pow(coverage,remap(height,0.7,0.8,1.0,lerp(1.0,0.5,anvil_bias));
+    //return pow(coverage, clamp(remap(height, 0.7, 0.8, 1.0, 0.8), 0.8, 1.0));
+    float anvil_bias = mix(1.0,0.5,height);
+    float anvil_rate = 0.6;
+    return pow(coverage, clamp(remap(height, 0.45, 0.95, 1.0,1-anvil_rate), anvil_bias, 1.0));
+}
+
+float erodeBlend(float x, float newMin) {
+    return max(0.0, remap(x, newMin, 1.0, 0.0, 1.0));
+}
+
+float cloudHiRes(in vec3 pos, in float curlStrength, in float origDensity, in float relativeHeight) {
+    // TODO: curlNoise
+    
+    float c = 0.0001; //miplevel?
+    vec3 curl = texture(curlNoise, c * pos.xz).xyz;
+
+    curl = 2.0 * curl - 1.0;
+    pos.xy += 1.9 * curlStrength * curl.xy;
+
+
+    vec4 densityNoise = texture(hiResCloudShape, 0.0004 * pos);
+    float erosion = 0.625 * densityNoise.r + 0.25 * densityNoise.g + 0.125 * densityNoise.b;
+
+    erosion = mix(erosion, 1.0 - erosion, clamp(relativeHeight * 10.0, 0.0, 1.0));
+    return remapClamped(origDensity, 1.0 * erosion, 1.0, 0.0, 1.0);
+}
+
+vec3 getUprezzedVoxelCloudDensity(in float relativeHeight,in vec3 sdf_density,in vec4 densityNoise)
+{
+    float erosion_noise=0;
+    float modelCloudType = 0.65;
+    if(ENABLE_NEW_NOISE==1)
+    {
+        float wispy_noise = mix(densityNoise.r,densityNoise.g,sdf_density.r);
+        float billowy_type_gradient = pow(sdf_density.r,0.25);
+        float billowy_noise = mix(densityNoise.b*0.3,densityNoise.a*0.3,billowy_type_gradient);
+        erosion_noise =  mix(wispy_noise,billowy_noise,modelCloudType);
+    }else
+    {
+        float wispy_noise = densityNoise.r;
+        float billowy_noise =densityNoise.g*0.625+densityNoise.b*0.25+densityNoise.a*0.125;
+        erosion_noise =  remapClamped(wispy_noise,billowy_noise,1.0,0.0,1.0);
+
+    }
+    float mdistance = sdf_density.g*SDFBOX_LENGTH;
+    //Get the hf noise which is to be applied nearby - First, get the distance from the sample to camera and only do the work within a distance of 150 meters. 
+    if(mdistance<1500)
+    {
+    	// Get the hf noise by folding the highest frequency billowy noise. 
+        float hhf_wisps = 1.0-pow(abs(abs(densityNoise.g*2.0-1.0)*2.0-1.0),4.0);
+        float hhf_billows = pow(abs(abs(densityNoise.a*2.0-1.0)*2.0-1.0),2.0);
+		float hhf_noise = clamp(mix(hhf_wisps, hhf_billows, modelCloudType),0.0,1.0);
+	
+		// Apply the HF nosie near camera.
+		float hhf_noise_distance_range_blender = remapClamped(mdistance, 500.0, 1500.0, 0.9, 1.0);
+		erosion_noise = mix(hhf_noise, erosion_noise, hhf_noise_distance_range_blender);
+    }
+
+	// Composote Noises and use as a Value Erosion
+	float uprezzed_density = remapClamped(sdf_density.r,erosion_noise,1.0,0.0,1.0);
+
+	// Modify User density scale = 0.85
+	float powered_density_scale = pow(0.85, 4.0);
+
+	// Apply User Density Scale Data to Result
+	uprezzed_density *= powered_density_scale; 
+
+     return vec3(uprezzed_density,mdistance,0);
+}
+
+// Checks if a cloud is at this point. If not, return 0 immediately. Otherwise get low-res density. (can still be 0 given cloud coverage)
+CloudInfo cloudTest(in vec3 pos, in float relativeHeight, in vec3 earthCenter, inout float coverage) {
+
+    float density;
+    CloudInfo cloudinfo = {0,-1,0};
+    //cloudInfo represent weathermap r:coverage, g:perciptation b:cloudtype
+    vec3 currentProj = getProjectedShellPoint(pos, earthCenter);
+    vec3 cloudPlacementInfo = texture(cloudPlacement, 0.0000125 * (currentProj.xz - camera.cameraPosition.xz)).xyz;// 8km
+
+
+    //sample Procedural Cloud Textures
+    //vulkan UVW is inverse to opengl so it is supposed to be -pos.y
+    vec3 samplePos = vec3(pos.x,-pos.y,pos.z)*0.000025;//based on the sample distance 4km*4km
+    vec4 densityNoise = texture(lowResCloudShape, samplePos);//4km*4km*2km    lowResCloudShape
+
+    //sample Voxel Cloud Textures
+    vec3 sdfDensity =vec3(-1);
+    vec3 sdfCloudBound = vec3(SDFBOX_LENGTH/2);
+    float dis_01,dis_02;
+    if(cloudrenderer.tempfloat<1)
+    {
+    
+        dis_01 = sdfBox(pos-cloudrenderer.tempVector.xyz,sdfCloudBound);
+        dis_02 = sdfBox(pos-cloudrenderer.tempVector.xyz-vec3(20000,0,0),sdfCloudBound);
+
+        if(dis_01<0)
+        {
+            vec3 samplePos_01 = (pos-cloudrenderer.tempVector.xyz+sdfCloudBound)/SDFBOX_LENGTH;
+            samplePos_01.y *=-1;
+            sdfDensity = max(sdfDensity,getUprezzedVoxelCloudDensity(relativeHeight,texture(sdfCloudShape_01,samplePos_01).xyz,texture(lowResCloudShape,samplePos_01)));
+        }
+        if(dis_02<0)
+        {
+            vec3 samplePos_02 = (pos-cloudrenderer.tempVector.xyz-vec3(20000,0,0)+sdfCloudBound)/SDFBOX_LENGTH;
+            samplePos_02.y *=-1;
+            //calculate the SDF density
+            sdfDensity = max(sdfDensity,getUprezzedVoxelCloudDensity(relativeHeight,texture(sdfCloudShape_02,samplePos_02).xyz,texture(lowResCloudShape,samplePos_02)));
+        }
+    }else
+    {
+        sdfDensity = vec3(0);
+    }
+
+    //高度梯度分层函数
+    float layerDensity = cloudLayerDensity(relativeHeight, cloudPlacementInfo.b);
+    // Apply Height function to the base cloud shape and exclude trvial noise effects(<0.3)
+    if(ENABLE_NEW_NOISE==1)
+    {
+        //apply low-freq wispy noise to the edge of cloud
+        density = layerDensity * remapClamped(densityNoise.r+densityNoise.g*cloudPlacementInfo.r, 0.3, 1.0, 0.0, 1.0);
+
+    }else{
+        density = layerDensity * remapClamped(densityNoise.x, 0.3, 1.0, 0.0, 1.0);
+    }
+
+    //Apply percipitation function to the base cloud density
+    float cumulonimbus_density = remapClamped(density+exp(2*(cloudPlacementInfo.g-1)),0.2,2.0,0.0,1.0);
+    density = mix(density,cumulonimbus_density,cloudrenderer.cloudinfo3.y);
+
+    coverage = 0.0;
+    // early check before more expensive math
+    if (density < 0.0001&&sdfDensity.r< 0.0001) 
+    {
+        cloudinfo.density = 0.0;
+        cloudinfo.sdf = -1.0;
+        return cloudinfo;
+    }
+
+    //对于特殊的效果，我们向风矢量添加了一个变化anvil_bias
+    //覆盖范围随着大气中的相对高度而增加，形成“铁砧形状”。风向也略有变化。
+    coverage = heightBiasCoverage(cloudPlacementInfo.r,relativeHeight)*cloudrenderer.coverage_rate;
+    
+    //rendermode = 2  shadowmode =2
+    //obsolate old sdf sampling
+//    if(cloudrenderer.cloudinfo4.x == 2||cloudrenderer.cloudinfo5.y==2)
+//    {
+//        //SDF cloud without detailed worly noise for erosion
+//        density = remapClamped(density, 1.0 - coverage, 1.0, 0.0, 1.0);
+//        cloudinfo.sdf = densityNoise.g*cloudrenderer.cloudinfo4.z; //*boundBoxScaleMax
+//        cloudinfo.lum = densityNoise.b;
+//    }
+//    if(cloudrenderer.cloudinfo4.x == 0)
+//    {
+        if(ENABLE_NEW_NOISE==1)
+        {
+            // todo: lerp normal 3DTexture noise with detailed Alligator noise high-freq and low-freq
+            float erosion =  0.25 * densityNoise.z+0.75 * densityNoise.w;//mix(0.3 * densityNoise.z, 0.3 * densityNoise.w, 0.5);   
+            // note: 随着覆盖范围的增加，低分辨率云的重映射效果会降低，云会膨胀。
+            erosion = remapClamped(erosion, coverage, 1.0, 0.0, 1.0)*cloudrenderer.erosion_rate;
+            // note: 使用remap对低频密度进行高频噪音侵蚀
+            density = remapClamped(density, erosion, 1.0, 0.0, 1.0);
+        }
+        else
+        {
+            // normal 3DTexture noise with detailed worly noise
+            float erosion = 0.625 * densityNoise.y + 0.25 * densityNoise.z + 0.125 * densityNoise.w;   
+            // note: 随着覆盖范围的增加，低分辨率云的重映射效果会降低，云会膨胀。
+            erosion = remapClamped(erosion, coverage, 1.0, 0.0, 1.0)*cloudrenderer.erosion_rate;
+            // note: 使用remap对低频密度进行高频噪音侵蚀
+            density = remapClamped(density, erosion, 1.0, 0.0, 1.0);
+        }
+
+//    } 
+    //separate sdf noise for old perlin-werly noise
+    if(sdfDensity.r>0.1&&(dis_01<0||dis_02<0))
+    {
+        cloudinfo.sdfDensity= sdfDensity.r;
+    }
+
+    cloudinfo.density = density;
+    cloudinfo.sdf = sdfDensity.g;
+
+    return cloudinfo;
+}
+
+// Code taken from camera.cpp
+mat3 fromAngleAxis( in vec3 angle, in float angleRad ) {
+    float cost = cos(angleRad);
+    float sint = sin(angleRad);
+
+    mat3 rot;
+    rot[0] = vec3(
+        cost + angle.x * angle.x * (1.f - cost),
+        angle.y * angle.x * (1.f - cost) + angle.z * sint,
+        angle.z * angle.x * (1.f - cost) - angle.y * sint
+        );
+    rot[1] = vec3(
+        angle.x * angle.y * (1.f - cost) - angle.z * sint,
+        cost + angle.y * angle.y * (1.f - cost),
+        angle.z * angle.y * (1.f - cost) + angle.x * sint
+        );
+    rot[2] = vec3(
+        angle.x * angle.z * (1.f - cost) + angle.y * sint,
+        angle.y * angle.z * (1.f - cost) - angle.x * sint,
+        cost + angle.z * angle.z * (1.f - cost)
+        );
+    return rot;
+}
+
+
+//#define WIND_STRENGTH 20.0
+
+// temp
+//#define WIDTH 1280
+#define WIDTH 1920
+//#define HEIGHT 720
+#define HEIGHT 1080
+//#define MAX_STEPS 100 //64 
+
+void main() {
+    float timeOffset = sky.wind.w;
+
+    //4 slices of inorder checkerboard update: 1/4 resolution
+    //每一帧我们都可以使用四分之一分辨率缓冲区来更新最终图像中每个 4x4 像素块的 16 个像素中的 1 个
+    int pxOffset = int(sun.color.a);
+    
+    int pxO_x = pxOffset % 4;
+    int pxO_y = pxOffset / 4;
+
+    //gl_GlobalInvocationID是当前执行单元在全局工作组中的位置的一种有效的三维索引
+    //简单理解为利用当前工作单元坐标索引计算得到棋盘像素点位置进行并行计算
+    //https://www.mobibrw.com/2018/16171
+    //curent workgroupsize = 32x32 
+    uint pxTargetX = gl_GlobalInvocationID.x * 4 + pxO_x;
+    uint pxTargetY = gl_GlobalInvocationID.y * 4 + pxO_y;
+
+
+    if (pxTargetX >= WIDTH || pxTargetY >= HEIGHT) return;
+
+    /// Extract the UV (0~1)
+    ivec2 dim = imageSize(resultImage); 
+	vec2 uv = vec2(pxTargetX, pxTargetY) / vec2(WIDTH, HEIGHT);
+     
+    /// Cast a ray
+    // Compute screen space point from UVs NDC(-1~1)
+    vec2 screenPoint = uv * 2.0 - 1.0;
+
+    // Extract camera information from uniform
+    vec3 camLook = vec3(camera.view[0][2], camera.view[1][2], camera.view[2][2]);
+    vec3 camRight = vec3(camera.view[0][0], camera.view[1][0], camera.view[2][0]);
+    vec3 camUp = vec3(camera.view[0][1], camera.view[1][1], camera.view[2][1]);
+
+
+    // Compute ray direction
+    const vec3 cameraPos = camera.cameraPosition.xyz;
+    vec3 refPoint = cameraPos - camLook;
+
+    //cameraParams.x: aspect  cameraParams.y: tanFov/2
+    //convert screenpoint to NDC space ray vector
+    //vulkan NDC is -y so it is supposed to be -camera.y
+    float tanfovdiv2 = camera.cameraParams.y;
+    vec3 p = refPoint + camera.cameraParams.x * screenPoint.x * tanfovdiv2 * camRight - screenPoint.y * tanfovdiv2 * camUp;
+    vec3 rayDirection = normalize(p - cameraPos);
+
+    vec3 sunDir = normalize(sun.directionBasis[1].xyz);
+    
+    float dotToSun = max(0.0, dot(sunDir, rayDirection));
+    float skyAmbient = dotToSun * 0.18;
+    skyAmbient *= skyAmbient * skyAmbient;
+    float sunDisk = smoothstep(SUN_ANGULAR_COS, SUN_ANGULAR_COS + 0.00003, dotToSun);
+    // IT'S TIME
+    dotToSun *= dotToSun * dotToSun * dotToSun;
+    dotToSun *= dotToSun * dotToSun * dotToSun;
+    dotToSun *= dotToSun * dotToSun * dotToSun;
+    dotToSun *= dotToSun * dotToSun * dotToSun;
+    dotToSun *= dotToSun * dotToSun;
+    if(sun.direction.y < 0.0) {
+        dotToSun *= dotToSun * dotToSun * dotToSun * dotToSun * dotToSun * dotToSun;
+    }
+    sunDisk = max(sunDisk, dotToSun);
+    sunDisk = max(0.0, sunDisk);
+
+    vec4 finalColor = vec4(0, 0, 0, 0);
+    vec3 backgroundCol;
+    if(sun.direction.y >= 0.0) {
+        backgroundCol = getAtmosphereColorPhysical(rayDirection, sunDir);
+        finalColor.a = max(skyAmbient, sunDisk);
+        finalColor.xyz = backgroundCol;
+    }
+
+    // It is likely we will never have an entirely unobstructed view of the horizon, so kill rays that would otherwise be executing.
+    //cos120 = -0.5
+    if(dot(rayDirection, vec3(0, 1, 0)) < -0.5) {
+        imageStore(resultImage, ivec2(pxTargetX, pxTargetY), finalColor);
+        return;
+    }
+
+    /// Raytrace the scene (a sphere, to become the atmosphere)
+    vec3 earthCenter = cameraPos;
+    earthCenter.y = -ATMOSPHERE_RADIUS * 0.5 * 0.995;
+    vec4 atmosphereSphereInner = vec4(earthCenter, ATMOSPHERE_RADIUS);//manipulate the lowerest cloud layer
+    vec4 atmosphereSphereOuter = vec4(earthCenter, ATMOSPHERE_RADIUS * 1.02);//*cloudrenderer.tempfloat
+
+    //Intersect two atmospheres with seamless switching
+    float lr = ATMOSPHERE_RADIUS;
+    float hr = 1.02*ATMOSPHERE_RADIUS;
+    float dis = length(cameraPos-earthCenter);
+    Intersection atmosphereIsectInner = raySphereIntersection(cameraPos, rayDirection, atmosphereSphereInner);
+    Intersection atmosphereIsectOuter = raySphereIntersection(cameraPos, rayDirection, atmosphereSphereOuter);
+
+
+//    if(atmosphereIsectInner.t < atmosphereIsectOuter.t) {
+//        finalColor = vec4(1,0,0,0);
+//        imageStore(resultImage, ivec2(pxTargetX, pxTargetY), finalColor);
+//        return;
+//    }else{//12500  the  same distance
+//            finalColor =  vec4(1,0,0,0);
+//        imageStore(resultImage, ivec2(pxTargetX, pxTargetY), finalColor);
+//        return;
+//    }
+
+    if(dis>lr&&dis<hr)//among the atmosphere: set raymarch start from camerapos
+    {
+        atmosphereIsectInner.t = 0;
+    }else if(dis>hr)//change order of view raymarch
+    if(dis>hr)//change order of view raymarch when the camera pos is over the atmosphere
+    {
+        Intersection temp = atmosphereIsectInner;
+        atmosphereIsectInner = atmosphereIsectOuter;
+        atmosphereIsectOuter = temp;
+    }
+
+
+    if(sun.direction.y < 0.0) {
+        // The sky should appear to rotate as the earth rotates
+        // Create a rotation matrix from scratch
+        // For now, just rotate an amount based on sun.direction.y.
+        mat3 rot = fromAngleAxis(normalize(vec3(1.0, 0.0, 1.0)), sun.direction.y * 0.5);
+        vec3 rotatedRayDir = rot * rayDirection;
+        vec3 rotatedRayOrigin = rot * cameraPos;
+        vec3 point = atmosphereIsectOuter.t * rotatedRayDir + rotatedRayOrigin;
+        vec3 projectedPoint = getProjectedShellPoint(point, earthCenter);
+        vec2 uv = 0.00002 * (projectedPoint.xz - cameraPos.xz) + 0.35; // magic numberz 
+        backgroundCol = NightSkyColor(uv);
+        backgroundCol *= sqrt(backgroundCol) * 0.75;
+        backgroundCol = pow(backgroundCol, vec3(2.2));
+        backgroundCol *= 10.0;
+        float falloff = pow(rayDirection.y, 6.0);
+        backgroundCol *= falloff;
+        backgroundCol = mix(vec3(0.3, 0.6, 4.0) * 0.05, backgroundCol, pow(rayDirection.y, 0.03125));
+        backgroundCol += sunDisk;
+        finalColor.a = sunDisk;
+    }
+
+    float cosTheta = dot(rayDirection, sunDir);
+    float t;
+    float accumDensity = 0.0;
+    float cirroDensity = 0.0;
+    float transmittance = 1.0;
+//    float Ambienttransmittance = 1.0;
+    vec3 AmbientScattering = {0,0,0};
+    float cirroTransmittance = 1.0;
+    float shortStep = 0.05 * ATMOSPHERE_THICKNESS*0.3;//300
+    float longStep = 0.05 * ATMOSPHERE_THICKNESS;//1000
+    float stepSize = longStep; 
+    float extraStepCount = 0;
+
+    // High-Performance Rendering Mode
+    if(cloudrenderer.cloudinfo4.x==2)
+    {
+        extraStepCount = 240;//步数补正
+        shortStep /= 2;//100
+        longStep /= 2;//333
+        stepSize = longStep; 
+    }
+
+
+    mat3 basis = mat3(sun.directionBasis);
+    vec3 samples[6] = {
+        basis * vec3(0, 0.6, 0),
+        basis * vec3(0, 0.5, 0.05),
+        basis * vec3(0.1, 0.75, 0),
+        basis * vec3(0.2, 2.5, 0.3),
+        basis * vec3(0, 6, 0),// one sample should be at distance 3x cone length
+        basis * vec3(-0.1, 1, -0.2)
+        
+    };
+
+    bool noHits = true;
+    int misses = 0;
+    int steps = 0;
+
+    //Apply multi-hgPhase function to present complex scattering phase fuction
+    float sliverDensity = 3.265+cloudrenderer.cloudinfo2.x;
+    float sliverSpread = cloudrenderer.cloudinfo2.y/10.0f;
+    float henyeyGreenstein = max(hgPhase(cosTheta, 0.6), (sliverDensity) * hgPhase(cosTheta, 0.99 - sliverSpread));
+    //float henyeyGreenstein = max(hgPhase(cosTheta, 0.6), 0.7 * hgPhase(cosTheta, 0.99 - 0.1));
+
+    //-----------Three-Phases Raymarching Algorithm-----------//
+    int curPhase = Phase1;
+    for(float t = atmosphereIsectInner.t; t < atmosphereIsectOuter.t; t += stepSize) 
+    {
+        vec3 currentPos = cameraPos + t * rayDirection;
+       
+        float coverage;
+        vec3 currentProj = getProjectedShellPoint(currentPos, earthCenter);//get projected point in ATMOSPHERE_INNER  about 5000m
+        float rHeight = getRelativeHeight(currentPos, currentProj, ATMOSPHERE_THICKNESS);
+        vec3 windOffset_1 = cloudrenderer.cloudinfo3.x * (sky.wind.xyz  + rHeight *vec3(0.1, 0.05, 0)) * (timeOffset + rHeight * 200.0);//sky.wind.xyz   
+        vec3 windOffset_2 = cloudrenderer.cloudinfo1.w * (sky.wind.xyz  + rHeight *vec3(0.1, 0.05, 0)) * (timeOffset + rHeight * 200.0);//cloudrenderer.wind_direction
+        //vec3 curl = texture(curlNoise, 0.0003 * currentProj.xz).xyz;
+
+        //curl = 2.0 * curl - 1.0;
+        //currentPos += 0.3 * stepSize * curl;
+
+        CloudInfo ci = cloudTest(currentPos + windOffset_1, rHeight, earthCenter, coverage);
+        float density = ci.density+ci.sdfDensity;
+        float loDensity = density;
+        
+        //mix the sdf denisty and noise density based on view distance
+        //compute distance of cameraPos to model clouds
+        vec3 sdfCloudBound = vec3(SDFBOX_LENGTH/2);
+        float dis_01 = sdfBox(cameraPos-cloudrenderer.tempVector.xyz,sdfCloudBound);
+        float dis_02 = sdfBox(cameraPos-cloudrenderer.tempVector.xyz-vec3(20000,0,0),sdfCloudBound);
+        float mdistance = min(dis_01,dis_02);
+        if(mdistance<3000)//原点距模型云5825m
+        {
+		    // Apply the HF nosie near camera.
+		    float noise_distance_range_blender = remapClamped(mdistance, 500.0, 3000.0, 0.2, 1.0);
+		    density = mix(density, ci.sdfDensity, 1-noise_distance_range_blender);
+        }
+
+        if(cloudrenderer.cloudinfo4.x==1)//debugmode
+        {
+            float linewidth = 25;
+            vec3 sdfBoxFrameBound = vec3(SDFBOX_LENGTH/2);
+            float debug_01 = sdBoxFrame(currentPos-cloudrenderer.tempVector.xyz,sdfBoxFrameBound,linewidth);
+            float debug_02 = sdBoxFrame(currentPos-cloudrenderer.tempVector.xyz-vec3(20000,0,0),sdfBoxFrameBound,linewidth);
+
+            if(debug_01<=0||debug_02<=0)
+            {
+                finalColor.rgb = vec3(1,0,0);
+                imageStore(resultImage, ivec2(pxTargetX, pxTargetY), finalColor);
+                return;
+            }
+        }
+
+
+
+        float sdfDistance = ci.sdf;
+        if(noHits)
+        {
+            //---------------------Transition point 1--------------------//
+            if(curPhase==Phase1)
+            {
+                if(sdfDistance>0)
+                {
+                    curPhase = Phase2;
+                }
+            }
+            //---------------------Transition point 2&4--------------------//
+            if(curPhase==Phase2)
+            {
+                if(sdfDistance==0)//trans 2
+                {
+                    curPhase = Phase3;
+                }else if(sdfDistance<0) //trans 4
+                {
+                    curPhase = Phase1;
+                }
+            }
+            //---------------------Transition point 3--------------------//
+            if(curPhase==Phase3)
+            {
+                if(sdfDistance>0)
+                {
+                    curPhase = Phase2;
+                }
+            }
+          }
+    	if (density > 0.0) // hit the cloud
+        {
+            misses = 0;
+            if (noHits) {
+                //start high-resolution march
+                stepSize = longStep;
+                t -= stepSize;
+                stepSize = shortStep;
+                noHits = false;
+                continue; // go back half a step
+            }
+
+            density = cloudHiRes(currentPos + windOffset_2, stepSize, density, rHeight);
+            if (density < 0.0001) continue;
+            float extinctionCoeff = 0.0;//a coefficient may has an influence on light extinction
+
+            if(cloudrenderer.cloudinfo5.y==0)
+            {
+                // Sample light propogation for Beer's law in a cone towards the light
+                for (int i = 0; i < 6; i++) {
+                    vec3 lsPos = currentPos + 3.0 * stepSize * samples[i];
+                    vec3 lsProj = getProjectedShellPoint(lsPos, earthCenter);
+                    float lsHeight = getRelativeHeight(lsPos, lsProj, ATMOSPHERE_THICKNESS);
+                    //all sample points are offset by a time-based wind and add an additional height-based offset
+                    // 对流层风向:windOffset_1  卷云层风向：windOffset_2
+                    windOffset_1 = cloudrenderer.cloudinfo3.x * (sky.wind.xyz   + lsHeight * vec3(0.1, 0.05, 0)) * (timeOffset + lsHeight * 200.0);
+                    windOffset_2 = cloudrenderer.cloudinfo1.w * (sky.wind.xyz  + lsHeight *vec3(0.1, 0.05, 0)) * (timeOffset + rHeight * 200.0);
+                    float lsDensity = cloudTest(lsPos + windOffset_1, lsHeight, earthCenter, coverage).density+cloudTest(lsPos + windOffset_1, lsHeight, earthCenter, coverage).sdfDensity;
+    
+                    //如果沿着视图行进的累积密度超过了一个阈值（我们使用 1.3），则我们将采样切换到低细节模式以进一步优化ray march
+                    if (lsDensity > 0.0&&extinctionCoeff<1.3) {                    
+                        lsDensity = cloudHiRes(lsPos + windOffset_2, stepSize, lsDensity, lsHeight);               
+                    }
+
+                    extinctionCoeff += lsDensity;   
+                }
+
+                // Accumulate extinction for that step
+                // Beer's Law with extra / artistic light penetration, blend with front-to-back opacity    
+                float beersLaw = exp(-cloudrenderer.extinction*extinctionCoeff);
+                // HG makes far clouds too dark, clouds away from sun dir need extra scattering 
+                //simulate multi-scattering
+                float beersModulated = max(beersLaw, 0.7 * exp(-0.25 * extinctionCoeff)*1.5);
+                //reduce the influence of multi-scattering when light ray is amost align with camera rayDirection
+                beersLaw = mix(beersLaw, beersModulated, -cosTheta * 0.5 + 0.5);
+                //keep cloud botton from being too dark
+                beersLaw = clamp(beersLaw,MULTISCATTERING_BASE,1.0);
+
+
+                float inScatter = 0.05 + pow(loDensity, remapClamped(rHeight, 0.3, 0.85, 0.5, 2.0));//depth probability
+                inScatter *= pow(remapClamped(rHeight, 0.07, 0.14, 0.1, 1.0), 0.8);//vertical probability
+
+                henyeyGreenstein = applyBackScattering(henyeyGreenstein,transmittance);
+                // recursive intergration: lumination needs to be itself computed
+                transmittance = mix(transmittance, inScatter * henyeyGreenstein * beersLaw , (1.0 - accumDensity));
+            }
+            else if(cloudrenderer.cloudinfo5.y==2)
+            {
+            //--------------------SDF Shadow---------------------//
+                //为了添加距离场阴影，还需要在循环之外传入或重新计算世界空间光向量:
+                vec3 sunPos = sun.location.xyz;
+                vec3 LightVector = normalize(currentPos-sunPos);
+                float LightLength = length(currentPos-sunPos);
+                //然后在光线行进主循环中，在云中光线采样步骤之后:
+                float SDFSteps = cloudrenderer.cloudinfo5.z;
+                float sdfshadow = 1;
+                float curdist = 0;
+                float DistanceAlongCone = 0;
+                float fixedStepsize = LightLength/SDFSteps; // it also could be tweaked to fit the arrangement fo cloud
+                vec3 sdfPos = sunPos + fixedStepsize;
+                for (int d = 1; d < SDFSteps; d++)
+                {
+                    DistanceAlongCone += curdist;
+                    sdfPos = sdfPos+LightVector*curdist;
+                    vec3 sdfProj = getProjectedShellPoint(sdfPos, earthCenter);
+                    float lsHeight = getRelativeHeight(sdfPos, sdfProj, ATMOSPHERE_THICKNESS);                 
+                    curdist = cloudTest( sdfPos, lsHeight, earthCenter, coverage).sdf;
+                    //current maxspheresize
+                    // LightTangent could be tweaked to control the range of shadow
+                    float LightTangent = cloudrenderer.cloudinfo5.w; //tan60 �� 0.32 
+                    float SphereSize = DistanceAlongCone * LightTangent; 
+                    sdfshadow = min( clamp(curdist / SphereSize,0.0f,1.0f) , sdfshadow);
+                }
+
+                extinctionCoeff = sdfshadow;
+                // Beer's Law with extra / artistic light penetration, blend with front-to-back opacity    
+                float beersLaw = exp(-cloudrenderer.extinction*extinctionCoeff);
+                // HG makes far clouds too dark, clouds away from sun dir need extra scattering 
+                //simulate multi-scattering
+                float beersModulated = max(beersLaw, 0.7 * exp(-0.25 * extinctionCoeff));
+                beersLaw = mix(beersLaw, beersModulated, -cosTheta * 0.5 + 0.5);
+                //keep cloud botton from being too dark
+                beersLaw = clamp(beersLaw,MULTISCATTERING_BASE,1.0);
+
+                float inScatter = 0.05 + pow(loDensity, remapClamped(rHeight, 0.3, 0.85, 0.5, 2.0));//depth probability
+                inScatter *= pow(remapClamped(rHeight, 0.07, 0.14, 0.1, 1.0), 0.8);//vertical probability
+
+                transmittance = mix(transmittance, inScatter * henyeyGreenstein * beersLaw , (1.0 - accumDensity));
+            }
+            //--------------------Ambient Scattering---------------------//
+            //sample ambient color on the up and down sides
+            AmbientScattering = CalAmbientScattering(AmbientScattering,rayDirection,backgroundCol,rHeight,extinctionCoeff,density,accumDensity);
+
+            accumDensity += density;
+
+        } else if (!noHits) {// when the ray get out the cloud right now, count the miss and turn to Phase Raymarching
+            misses++;
+            if (misses >= 6) {//10 maybe it is too big
+                noHits = true; // return to low resolution raymarching
+		        //---------------------Phase1:LongStep Adaptive Raymarching--------------------//
+		        if(curPhase==Phase1)
+		        {
+                	stepSize = longStep+(longStep*0.04*max(misses,10));//125+5*misses
+		        }
+                //---------------------Phase2: SDF Raymarching--------------------//
+		        if(curPhase==Phase2)
+		        {
+		        	//when ray has entered or exited the cloud, increase stepsize manually to accelerate sdf sphere tracing
+		            stepSize = clamp(ci.sdf*cloudrenderer.cloudinfo4.y,shortStep,longStep*1.7);     
+		        }
+                //---------------------Phase3:ShortStep Adaptive Raymarching--------------------//
+		        if(curPhase==Phase3)
+		        {
+                	stepSize = shortStep+(4*max(misses,10));//37,5+4*misses
+		        }
+            }
+
+        }
+
+
+//        else if(cloudrenderer.cloudinfo4.x == 2&&noHits&&ci.sdf>0)// whe the ray don't hit the cloud, start SDF spheretracing
+//        {
+//            if(ci.sdf<600)//when ray has entered or exited the cloud, increase stepsize manually to accelerate sdf sphere tracing
+//            {
+//                stepSize = 0.05 * ATMOSPHERE_THICKNESS;
+//                stepSize *= 0.3;
+//            }
+//            else 
+//            {
+//                stepSize = ci.sdf*cloudrenderer.cloudinfo4.y*1000;//cloudrenderer.cloudinfo4.y;//*sdf_scale               
+//            }
+//        }
+        
+        //early-exist to save computing resource
+        if(accumDensity > 0.99) {
+            accumDensity = 1.0;
+            break;
+        }
+
+        //if step is greater than max_steps, quit out
+        if (++steps > cloudrenderer.cloudinfo4.w) break;
+
+        //-------------------------------------Alto cloud Layer------------------------------------//
+        //sample Alto cloud Layer with dif wind_direction before remarching end
+        if(steps == cloudrenderer.cloudinfo4.w||t+stepSize > atmosphereIsectOuter.t)
+        {
+            windOffset_1 = cloudrenderer.cloudinfo3.x * (cloudrenderer.wind_direction.xyz + vec3(0.1, 0.05, 0)) * (timeOffset + 200.0);
+            mat3 rot = fromAngleAxis(normalize(vec3(1.0, 0.0, 1.0)), sun.direction.y * 0.5);
+            vec3 rotatedRayDir = rot * rayDirection;
+            vec3 rotatedRayOrigin = rot * cameraPos;
+            vec3 point = atmosphereIsectOuter.t * rotatedRayDir + rotatedRayOrigin;
+            vec3 projectedPoint = getProjectedShellPoint(point, earthCenter);
+            cirroDensity = 0;
+            cirroDensity = cloudCirroSample(projectedPoint+windOffset_1,earthCenter);
+            if (cirroDensity < 0.0001) continue;
+
+            //lighting
+            float extinctionCoeff = 0.0;
+            // Sample light propogation for Beer's law in a cone towards the light
+            for (int i = 0; i < 4; i++) {
+                vec3 lsPos = currentPos + i* sunDir * stepSize ;//samples[i]   sunDir
+                float lsDensity = cloudCirroSample(lsPos+windOffset_1,earthCenter);         
+
+                extinctionCoeff += lsDensity;   
+            }
+        
+            // Beer's Law with extra / artistic light penetration, blend with front-to-back opacity     
+            float beersLaw = exp(-extinctionCoeff);
+            // HG makes far clouds too dark, clouds away from sun dir need extra scattering
+            float beersModulated = max(beersLaw, 0.7 * exp(-0.25 * extinctionCoeff));
+
+            beersLaw = mix(beersLaw, beersModulated, -cosTheta * 0.5 + 0.5);
+            float inScatter = 0.05 + pow(loDensity, remapClamped(1, 0.3, 0.85, 0.5, 2.0));
+            inScatter *= pow(remapClamped(1, 0.07, 0.34, 0.1, 1.0), 0.8);
+            //inScatter = loDensity * loDensity;
+            cirroTransmittance = mix(cirroTransmittance, inScatter * henyeyGreenstein * beersLaw , (1.0 - cirroDensity));
+                 
+            //AmbientScattering has been overlooked
+
+            break;
+        }
+    }
+//-------------------------------------Final Shadering------------------------------------//
+    // opacity fades to prevent hard cutoff at horizon for 
+    accumDensity *= smoothstep(0, 1, min(1, remap(rayDirection.y, 0, 0.1, 0.35, 1)));
+    accumDensity = min(accumDensity, 0.999);
+
+    cirroDensity *= smoothstep(0, 1, min(1, remap(rayDirection.y, 0, 0.1, 0, 1)));
+    cirroDensity = min(cirroDensity, 0.999);
+
+    vec3 cloudColor;
+    vec3 cirroCloudColor;
+    vec3 ambientCol =  AmbientScattering*(1+2*cloudrenderer.cloudinfo2.w);//exp(-transmittance)  backgroundCol *
+    //vec3 nightBackgroundCol =  (vec3(0.3, 0.6, 4.0) * 0.05 * pow(rayDirection.y, 0.03125)) * Ambienttransmittance;
+//    if(sun.direction.y >= 0.0) {
+//        cloudColor = sun.color.xyz * (cloudrenderer.cloudinfo2.z*sun.intensity * vec3(max(0.0, transmittance))) + dayBackgroundCol; 
+//        cirroCloudColor = sun.color.xyz * (cloudrenderer.cloudinfo2.z*sun.intensity * vec3(max(0.0, cirroTransmittance))) + dayBackgroundCol;
+//    } else {
+//        cloudColor = sun.color.xyz * (cloudrenderer.cloudinfo2.z*sun.intensity * vec3(max(0.0, transmittance))) + nightBackgroundCol ;
+//        cirroCloudColor = sun.color.xyz * (cloudrenderer.cloudinfo2.z*sun.intensity * vec3(max(0.0, cirroTransmittance))) + nightBackgroundCol;
+//    }
+
+    cloudColor = sun.color.xyz * (cloudrenderer.cloudinfo2.z*sun.intensity * vec3(max(0.0, transmittance))) + ambientCol; 
+    cirroCloudColor = sun.color.xyz * (cloudrenderer.cloudinfo2.z*sun.intensity * vec3(max(0.0, cirroTransmittance))) + ambientCol;
+
+    //Light intensity 根据 Ambient(backgroundCol) 或 Sun 光源着色并输出到颜色通道
+    finalColor.rgb = mix(backgroundCol, cloudColor, accumDensity);
+    //alpha = light_absorption = Extinction
+    finalColor.a *= max(1.0 - accumDensity, 0.0);
+
+    if(accumDensity<0.5)//0.5
+    {
+        finalColor.rgb = mix(finalColor.rgb, cirroCloudColor, cirroDensity);
+        finalColor.a *= max(1.0 - cirroDensity, 0.0);
+    }
+
+
+
+    imageStore(resultImage, ivec2(pxTargetX, pxTargetY), finalColor);
+}

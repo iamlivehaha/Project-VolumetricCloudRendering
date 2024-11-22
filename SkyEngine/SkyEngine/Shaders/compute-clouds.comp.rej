@@ -1,0 +1,9 @@
+diff a/SkyEngine/SkyEngine/Shaders/compute-clouds.comp b/SkyEngine/SkyEngine/Shaders/compute-clouds.comp	(rejected hunks)
+@@ -538,7 +538,6 @@
+                 float lsDensity = cloudTest(lsPos + windOffset, lsHeight, earthCenter, coverage);
+                 
+                 //���������ͼ�н����ۻ��ܶȳ�����һ����ֵ������ʹ�� 1.3���������ǽ������л�����ϸ��ģʽ�Խ�һ���Ż�ray march
+-                if (lsDensity > 0.0&&densityAlongLight<1.3) {
+                 if (lsDensity > 0.0&&densityAlongLight<2.3) {
+                     lsDensity = cloudHiRes(lsPos + windOffset, stepSize, lsDensity, lsHeight);               
+                 }
